@@ -5,10 +5,12 @@ from __future__ import annotations
 import concurrent.futures
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -17,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "plugins/plan-review/scripts"
 sys.path.insert(0, str(SCRIPTS))
 
-from plan_review import context, hooks, policy, reviewer, submission  # noqa: E402
+from plan_review import context, hooks, policy, reviewer, state, submission  # noqa: E402
 from plan_review.state import StateError, Store, digest  # noqa: E402
 
 APPROVE = {"verdict": "approve", "summary": "No blocking issues.", "findings": []}
@@ -186,6 +188,20 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(
             self.tool("apply_patch", {})["hookSpecificOutput"]["permissionDecision"], "deny"
         )
+
+    def test_failure_diagnostics_survive_submission_and_clear_on_new_review(self):
+        diagnostic = {"timeout_seconds": 600, "last_observed_phase": "waiting_for_model"}
+
+        def fail(*_):
+            raise reviewer.ReviewError("Timed out", diagnostic)
+
+        response = self.direct_submit(review=fail)
+        self.assertFalse(response["approved"])
+        self.assertIsNone(response["verdict"])
+        self.assertEqual(response["diagnostics"], diagnostic)
+        self.assertEqual(self.state()["diagnostics"], diagnostic)
+        self.assertTrue(self.direct_submit()["approved"])
+        self.assertNotIn("diagnostics", self.state())
 
     def test_invalid_verdict_never_approves(self):
         result = self.submit(review=lambda *_: {**REJECT, "verdict": "approve"})
@@ -430,8 +446,201 @@ class WorkflowTests(unittest.TestCase):
         self.tool("Bash", {"command": base + " reset"})
         self.assertEqual(self.state()["status"], "idle")
 
+    def test_saved_plan_and_progress_are_readable_while_failed(self):
+        self.direct_submit("Complete saved body", review=lambda *_: REJECT)
+        base = submission.submit_command().removesuffix(" submit --stdin")
+        for action in ("plan", "status"):
+            result = self.tool("Bash", {"command": base + " " + action})
+            output = subprocess.check_output(
+                ["sh", "-c", result["hookSpecificOutput"]["updatedInput"]["command"]], text=True
+            )
+            value = json.loads(output)
+            self.assertEqual(value["status"], "needs_revision")
+            if action == "plan":
+                self.assertEqual(value["plan"], "Complete saved body")
+
+    def test_native_scope_is_saved_and_second_project_edit_blocks_execution(self):
+        second = self.path / "second project"
+        second.mkdir()
+        for root in (self.cwd, second):
+            subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+        source = second / "logic.py"
+        source.write_text("answer = 1\n")
+        seen = []
+
+        def engine(value, *_):
+            seen.append(value)
+            return APPROVE
+
+        command = (
+            submission.submit_command()
+            + " --project "
+            + shlex.quote(str(self.cwd))
+            + " --project "
+            + shlex.quote(str(second))
+            + " --evidence "
+            + shlex.quote(str(source))
+            + " <<'BODY'\nReview both\nBODY"
+        )
+        self.event("PreToolUse", engine, tool_name="Bash", tool_input={"command": command})
+        self.assertEqual(
+            self.state()["review_scope"]["projects"],
+            [str(self.cwd.resolve()), str(second.resolve())],
+        )
+        self.assertEqual(len(seen[0]["repository"]["projects"]), 2)
+        source.write_text("answer = 2\n")
+        result = self.tool("apply_patch", {"command": "patch"})
+        self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertEqual(self.state()["status"], "needs_revision")
+
+    def test_invalid_new_scope_revokes_previous_approval(self):
+        self.direct_submit("Approved old body")
+        command = (
+            submission.submit_command()
+            + " --project /missing/project"
+            + " <<'BODY'\nNew unreviewed body\nBODY"
+        )
+        result = self.tool("Bash", {"command": command})
+        self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertEqual(self.state()["status"], "needs_revision")
+        self.assertNotIn("result", self.state())
+        self.assertEqual(
+            self.tool("apply_patch", {"command": "patch"})["hookSpecificOutput"][
+                "permissionDecision"
+            ],
+            "deny",
+        )
+
+    def test_changed_final_body_revokes_approval_even_when_evidence_disappears(self):
+        subprocess.run(["git", "-C", str(self.cwd), "init", "-q"], check=True)
+        source = self.cwd / "logic.py"
+        source.write_text("answer = 1\n")
+        command = (
+            submission.submit_command()
+            + " --project "
+            + shlex.quote(str(self.cwd))
+            + " --evidence "
+            + shlex.quote(str(source))
+            + " <<'BODY'\nApproved body\nBODY"
+        )
+        self.tool("Bash", {"command": command})
+        self.assertEqual(self.state()["status"], "approved")
+        source.unlink()
+        result = self.event(
+            "Stop", last_assistant_message="<proposed_plan>Changed body</proposed_plan>"
+        )
+        self.assertFalse(result["continue"])
+        self.assertEqual(self.state()["status"], "needs_revision")
+        self.assertNotIn("result", self.state())
+
+    def test_malformed_persisted_scope_denies_tools_without_hook_failure(self):
+        self.direct_submit()
+        with self.store.locked():
+            value = self.store.read()
+            value["review_scope"] = {"unexpected": "value"}
+            self.store.write(value)
+        result = self.tool("apply_patch", {"command": "patch"})
+        self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_real_engine_progress_is_durable_before_run_finishes(self):
+        binary = self.path / "fake-codex"
+        binary.write_text(
+            f"#!{sys.executable}\nimport json,sys,time\nfrom pathlib import Path\n"
+            "print(json.dumps({'type':'item.started','item':{'type':'command_execution',"
+            "'id':'one','command':'private'}}),flush=True)\n"
+            "time.sleep(2.5)\n"
+            "Path(sys.argv[sys.argv.index('-o')+1]).write_text(json.dumps("
+            "{'verdict':'approve','summary':'OK','findings':[]}))\n"
+        )
+        binary.chmod(0o700)
+        with (
+            patch.dict(
+                os.environ,
+                {"PLAN_REVIEW_CODEX_BIN": str(binary), "PLAN_REVIEW_TIMEOUT_SECONDS": "5"},
+            ),
+            concurrent.futures.ThreadPoolExecutor() as pool,
+        ):
+            task = pool.submit(hooks.review_plan, self.store, self.cwd, "Review", reviewer.run)
+            deadline = time.monotonic() + 4
+            running = None
+            while time.monotonic() < deadline:
+                value = self.state()
+                if value.get("progress", {}).get("last_observed_phase") == "running_tool":
+                    running = value
+                    break
+                time.sleep(0.05)
+            task.result(timeout=5)
+        self.assertIsNotNone(running)
+        self.assertEqual(running["status"], "reviewing")
+        self.assertNotIn("private", json.dumps(running["progress"]))
+        self.assertEqual(self.state()["review_metrics"]["commands_started"], 1)
+
 
 class ProtocolTests(unittest.TestCase):
+    def test_installed_standalone_commands_find_the_hooks_state_directory(self):
+        with tempfile.TemporaryDirectory() as td, patch.dict(os.environ):
+            for name in ("PLAN_REVIEW_DATA_DIR", "PLUGIN_DATA"):
+                os.environ.pop(name, None)
+            os.environ["CODEX_HOME"] = td
+            module = (
+                Path(td)
+                / "plugins/cache/codex-plan-review/plan-review/0.1.3/scripts/plan_review/state.py"
+            )
+            with patch.object(state, "__file__", str(module)):
+                expected = Path(td) / "plugins/data/plan-review-codex-plan-review/plan-review"
+                self.assertEqual(state.data_root().resolve(), expected.resolve())
+
+    def test_scoped_submission_parser_rejects_unknown_or_incomplete_options(self):
+        command = (
+            submission.submit_command() + " --project '/tmp/repo with spaces' --evidence /tmp/file"
+        )
+        good = command + " <<'BODY'\nPlan\nBODY"
+        value = submission.parse_submission(good)
+        self.assertEqual(value["scope"]["projects"], ["/tmp/repo with spaces"])
+        for header in [command + " --project", command + " --unknown /tmp", command + " ; touch x"]:
+            self.assertIsNone(submission.parse_submission(header + " <<'BODY'\nPlan\nBODY"))
+
+    def test_common_read_commands_work_but_git_config_and_sed_execution_do_not(self):
+        for command in [
+            "git -C '/tmp/repo with spaces' status --short",
+            "git --no-pager -C/tmp/repo diff --stat",
+            "sed -n '1,30p' file.json",
+            "sed -n -e '1,$p' file.json",
+        ]:
+            self.assertTrue(policy.read_only_shell(command), command)
+        for command in [
+            "git -C /tmp/repo -c alias.status=writer status",
+            "git -C /tmp/repo checkout main",
+            "git -C /tmp/repo diff --ext-diff",
+            "sed -i '1d' file",
+            "sed '1e' file",
+            "sed '1w output' file",
+            "sed -f script file",
+            "sed -n '1p; e writer' file",
+        ]:
+            self.assertFalse(policy.read_only_shell(command), command)
+
+    def test_oversized_review_does_not_get_approved(self):
+        with self.assertRaises(reviewer.ReviewError):
+            reviewer.validate({**APPROVE, "summary": "x" * 601})
+        with self.assertRaises(reviewer.ReviewError):
+            reviewer.validate({**CONCERNS, "findings": CONCERNS["findings"] * 6})
+
+    def test_review_budget_fits_host_hook_budget(self):
+        with patch.dict(os.environ):
+            os.environ.pop("PLAN_REVIEW_TIMEOUT_SECONDS", None)
+            self.assertEqual(hooks.limits()[0], 600)
+        with patch.dict(os.environ, {"PLAN_REVIEW_TIMEOUT_SECONDS": "900"}):
+            self.assertEqual(hooks.limits()[0], 900)
+        for timeout in ["0", "901", "invalid"]:
+            with patch.dict(os.environ, {"PLAN_REVIEW_TIMEOUT_SECONDS": timeout}):
+                with self.assertRaises(StateError):
+                    hooks.limits()
+        config = json.loads((ROOT / "plugins/plan-review/hooks/hooks.json").read_text())
+        self.assertGreaterEqual(
+            config["hooks"]["PreToolUse"][0]["hooks"][0]["timeout"], reviewer.MAX_TIMEOUT + 60
+        )
+
     def test_submission_parser_rejects_extra_shell_and_other_script(self):
         good = submission.submit_command() + " <<'PLAN'\nComplete plan\nPLAN"
         self.assertEqual(submission.extract_submission(good), "Complete plan")

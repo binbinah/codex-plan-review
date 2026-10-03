@@ -24,6 +24,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "plugins/plan-review/scripts"))
 from plan_review.context import redact  # noqa: E402
+from plan_review.reviewer import DEFAULT_TIMEOUT, MAX_TIMEOUT  # noqa: E402
 from plan_review.state import Store, digest  # noqa: E402
 
 
@@ -121,7 +122,7 @@ class AppServer:
                 return message["result"]
         raise TimeoutError(method)
 
-    def turn(self, thread, model, mode, prompt, timeout=420, sandbox=None):
+    def turn(self, thread, model, mode, prompt, timeout=MAX_TIMEOUT + 120, sandbox=None):
         result = self.request(
             "turn/start",
             {
@@ -161,7 +162,7 @@ class AppServer:
                 self.proc.wait()
 
 
-def run(inventory_only=False):
+def run(inventory_only=False, review_only=False):
     source_home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
     config = tomllib.loads((source_home / "config.toml").read_text())
     with tempfile.TemporaryDirectory(prefix="codex-plan-review-live-") as temp:
@@ -197,7 +198,7 @@ def run(inventory_only=False):
             **os.environ,
             "CODEX_HOME": str(home),
             "PLAN_REVIEW_DATA_DIR": str(data),
-            "PLAN_REVIEW_TIMEOUT_SECONDS": "240",
+            "PLAN_REVIEW_TIMEOUT_SECONDS": str(DEFAULT_TIMEOUT),
             "PLAN_REVIEW_MAX_ROUNDS": "3",
         }
         checked(["git", "init", "--initial-branch=main", str(workspace)], env)
@@ -324,6 +325,28 @@ def run(inventory_only=False):
             if not final_plans or digest(final_plans[-1].strip()) != state["plan_hash"]:
                 raise AssertionError("Rendered final Plan differs from the reviewed body")
             print("LIVE phase=approved_before_execution", flush=True)
+            if review_only:
+                runs = [
+                    event["params"]["run"]
+                    for event in server.events
+                    if event.get("method") == "hook/completed"
+                ]
+                return {
+                    "codex_version": checked(["codex", "--version"], env).strip(),
+                    "marketplace_install_verified": bool(installed),
+                    "native_plan_review": state["result"]["verdict"],
+                    "plan_review_rounds": state["rounds"],
+                    "review_metrics": state.get("review_metrics"),
+                    "rendered_plan_matches_reviewed_body": True,
+                    "no_implementation_before_approval": True,
+                    "completed_hook_events": [run["eventName"] for run in runs],
+                    "failed_hooks": [
+                        run["eventName"]
+                        for run in runs
+                        if run["status"] not in {"completed", "succeeded"}
+                    ],
+                    "global_config_modified": False,
+                }
             # The test client performs the normal user-selected transition to implementation.
             server.turn(
                 thread_id,
@@ -379,8 +402,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path)
     parser.add_argument("--inventory-only", action="store_true")
+    parser.add_argument("--review-only", action="store_true")
     args = parser.parse_args()
-    result = run(args.inventory_only)
+    result = run(args.inventory_only, args.review_only)
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n")

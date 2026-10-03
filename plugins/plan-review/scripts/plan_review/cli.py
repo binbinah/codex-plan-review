@@ -22,12 +22,16 @@ def main(argv: list[str] | None = None) -> int:
     commands.add_parser("doctor")
     submit = commands.add_parser("submit")
     submit.add_argument("--stdin", action="store_true", required=True)
-    for name in ("review", "status", "retry", "reset"):
+    submit.add_argument("--project", action="append", default=[])
+    submit.add_argument("--evidence", action="append", default=[])
+    for name in ("review", "status", "plan", "retry", "reset"):
         child = commands.add_parser(name)
         child.add_argument("--session", required=True)
         child.add_argument("--cwd", default=str(Path.cwd()))
         child.add_argument("--data-dir", type=Path)
         if name == "review":
+            child.add_argument("--project", action="append", default=[])
+            child.add_argument("--evidence", action="append", default=[])
             source = child.add_mutually_exclusive_group(required=True)
             source.add_argument("--plan", type=Path)
             source.add_argument("--stdin", action="store_true")
@@ -60,10 +64,12 @@ def main(argv: list[str] | None = None) -> int:
                 with store.locked():
                     store.write({"status": "idle", "reset_by": "explicit_cli"})
                 result = {"status": "idle", "notice": "本计划评审已取消；不改变 Codex 权限或授权。"}
-            elif args.command == "status":
+            elif args.command in {"status", "plan"}:
                 with store.locked():
                     state = store.read()
                 result = {k: v for k, v in state.items() if k not in {"plan", "requests"}}
+                if args.command == "plan":
+                    result["plan"] = state.get("plan")
             else:
                 if args.command == "retry":
                     with store.locked():
@@ -81,7 +87,12 @@ def main(argv: list[str] | None = None) -> int:
                         if args.plan
                         else sys.stdin.read(200001)
                     )
-                result = review_plan(store, Path(args.cwd), normalize_plan(plan))
+                scope = (
+                    state.get("review_scope")
+                    if args.command == "retry"
+                    else {"projects": args.project, "evidence_files": args.evidence}
+                )
+                result = review_plan(store, Path(args.cwd), normalize_plan(plan), scope=scope)
         print(json.dumps(result, ensure_ascii=False))
         if args.command in {"review", "retry"}:
             with store.locked():

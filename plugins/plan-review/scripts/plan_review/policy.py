@@ -54,12 +54,43 @@ def read_only_shell(command: str) -> bool:
             for p in parts[1:]
         ):
             continue
-        if (
-            exe == "git"
-            and len(parts) > 1
-            and parts[1] in {"status", "diff", "show", "log", "rev-parse", "ls-files", "grep"}
-            and not any(p.startswith("--output") for p in parts[2:])
-        ):
+        if exe == "sed":
+            operands = parts[1:]
+            if operands and operands[0] in {"-n", "--quiet", "--silent"}:
+                operands = operands[1:]
+            if operands and operands[0] == "-e":
+                operands = operands[1:]
+            # Only simple print/quit/delete expressions; never e/w, -i or script files.
+            if operands and re.fullmatch(r"(?:\d+(?:,\d+|,\$)?|\$)?[pqd]", operands[0]):
+                if all(not value.startswith("-") for value in operands[1:]):
+                    continue
+            return False
+        if exe == "git":
+            operands = parts[1:]
+            while operands:
+                if operands[0] in {"--no-pager", "--literal-pathspecs"}:
+                    operands = operands[1:]
+                elif operands[0] == "-C" and len(operands) > 1:
+                    operands = operands[2:]
+                elif operands[0].startswith("-C") and len(operands[0]) > 2:
+                    operands = operands[1:]
+                else:
+                    break
+            # Config overrides can define executable aliases/helpers. Do not admit them.
+            if not operands or operands[0] not in {
+                "status",
+                "diff",
+                "show",
+                "log",
+                "rev-parse",
+                "ls-files",
+                "grep",
+            }:
+                return False
+            if any(
+                value.startswith(("--output", "--ext-diff", "--textconv")) for value in operands[1:]
+            ):
+                return False
             continue
         return False
     return True

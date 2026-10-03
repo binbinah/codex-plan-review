@@ -24,6 +24,21 @@ Ordinary questions, investigation, and status updates do not need submission.
    assignment. The PreToolUse hook receives the body, runs the independent reviewer
    on the host, binds the state to this session, and returns JSON through stdout.
    No plan file or manual session id is required, even in a read-only Plan sandbox.
+   From a multi-repository workspace, append one `--project <directory>` per target
+   before the heredoc. Add `--evidence <file>` for the key existing source files
+   already inspected. Evidence must reside inside the declared projects; a source
+   mirror without Git needs at least one evidence file. These paths bind review to
+   the actual projects, without changing the submitted Markdown body. For example:
+
+   ```sh
+   python3 <installed-plugin-root>/scripts/review.py submit --stdin --project /path/repo --evidence /path/repo/src/entry.py <<'CODEX_PLAN_REVIEW'
+   <complete Markdown plan body>
+   CODEX_PLAN_REVIEW
+   ```
+
+   The reviewer uses supplied evidence first, permits targeted read-only checks,
+   and stops after a bounded query budget. On query-budget failure, supply the
+   missing source evidence and resubmit; do not just raise the wall-clock timeout.
 3. Check **both `approved: true` and `verdict: "approve"`**. For concerns/reject,
    revise or rebut with evidence and resubmit the complete body. The JSON reports
    engine failures and remaining round budget; exit 0 from the output command
@@ -44,8 +59,9 @@ For a standalone CLI review outside the native workflow, use
 An explicit `--data-dir` selects the same state directory as the hook if needed.
 Exit 0 means technical approval; exit 3 means the plan remains gated; exit 2 is an error.
 
-For native recovery, call the injected script with only `status`, `retry`, or
-`reset`; hooks bind them to this session. Use `retry` only for user-requested renewed
+For native recovery, call the injected script with only `status`, `plan`, `retry`, or
+`reset`; hooks bind them to this session. `status` includes live phase/timing metadata;
+`plan` returns the saved body even while review is gated. Use `retry` only for user-requested renewed
 review, then resubmit the original complete body. Use `reset` only when the user
 cancels this plan or explicitly requests clearing its state. Neither changes
 Codex permissions. Standalone recovery requires the actual session and state directory.

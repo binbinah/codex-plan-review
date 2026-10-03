@@ -42,7 +42,7 @@
           {
             "type": "command",
             "command": "python3 \"${PLUGIN_ROOT}/scripts/review.py\" hook",
-            "timeout": 300,
+            "timeout": 960,
             "statusMessage": "Checking plan review or reviewing submitted plan"
           }
         ]

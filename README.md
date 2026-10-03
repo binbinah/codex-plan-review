@@ -76,9 +76,21 @@ flowchart TD
 
 提交命令无需填写 session id：hook 使用宿主提供的当前会话定位。红队在 hook 的宿主进程运行，实际 shell 命令改写为输出结果 JSON，因此只读 Plan sandbox 不需要写插件状态目录。正文中的 shell 表达式不会执行。
 
+从多仓库工作区提交时，在 `submit --stdin` 后追加每个实际项目的 `--project <目录>`，并用 `--evidence <文件>` 提供主会话已核查的关键源码。这些参数都在字面 heredoc 之前，不改变计划正文或会话定位。例如：
+
+```sh
+python3 <plugin-root>/scripts/review.py submit --stdin --project /path/backend --project /path/frontend --evidence /path/backend/src/entry.py --evidence /path/frontend/src/entry.ts <<'CODEX_PLAN_REVIEW'
+<完整 Markdown 计划正文>
+CODEX_PLAN_REVIEW
+```
+
+最多 4 个项目、12 个证据文件。证据必须在指定项目内，不能通过符号链接越界；单文件最大 1 MB。正文摘录总计最多 48000 字符，每文件最多 12000 字符，截断会明确标记，完整文件哈希仍参与校验。非 Git 源码镜像必须提供至少一个关键文件，其校验覆盖所选证据文件；Git 项目同时校验各自 HEAD、暂存/未暂存变更和未跟踪内容。多仓库工作区不再用空 Git 信息作为评审依据，也不会扫描无关仓库。
+
 计划使用 SHA-256 绑定，状态使用进程锁和原子写入。仓库或项目规则在批准后、首次实施前变化会要求重新评审。并发提交同一计划只启动一个引擎；旧评审不能覆盖更新后的状态。
 
 红队通过 `codex exec -s read-only --ephemeral` 运行，禁用递归 hooks、plugins、apps、子 agent、网页搜索和读取到的本地 MCP 配置。模型、供应商与鉴权配置保留。结果受 JSON Schema 约束，并再次校验 verdict 与问题严重程度一致。
+
+红队优先读取提交的证据，按具体疑点做定向查询；提示词要求最多 8 条查询，进程监督器在超过 12 条命令时终止并返回 `query_budget`，不记为批准。审查不重复项目开工、fetch、构建、测试或 OPS 调研流程。输出最多 5 个实质问题，提示词要求总文字少于 3000 字符，Schema 与运行时另外限制字段长度。项目规则作为计划约束传入，子进程禁用自动 AGENTS 注入以避免把作者的操作流程执行一遍。红队默认使用 `high` 推理强度，只在子进程中覆盖；主会话的推理强度、模型和供应商配置不变。需要继承原强度或明确深审时可设置下表的环境变量。
 
 ## 配置与排障
 
@@ -87,7 +99,8 @@ flowchart TD
 | 环境变量 | 默认值 | 作用 |
 |---|---|---|
 | `PLAN_REVIEW_CODEX_BIN` | `codex` | 红队 Codex 可执行文件 |
-| `PLAN_REVIEW_TIMEOUT_SECONDS` | `240` | 每次评审超时，允许 1–270 秒；提交 hook 总预算 300 秒 |
+| `PLAN_REVIEW_REASONING_EFFORT` | `high` | 仅红队子进程使用；可选 inherit/low/medium/high/xhigh，inherit 保留原配置 |
+| `PLAN_REVIEW_TIMEOUT_SECONDS` | `600` | 每次评审总时限，允许 1–900 秒；提交 hook 总预算 960 秒 |
 | `PLAN_REVIEW_MAX_ROUNDS` | `3` | 自动评审轮次，允许 1–10 |
 | `PLAN_REVIEW_DATA_DIR` | 插件 `PLUGIN_DATA/plan-review` | 私有状态目录；无宿主变量时使用 XDG state 目录 |
 | `PLAN_REVIEW_ENABLED` | 开启 | `0` 显式关闭工作流；不会改变 Codex 权限 |
@@ -104,7 +117,13 @@ PLAN_BODY
 
 `review` 返回码 0 表示技术批准，3 表示仍未放行，2 表示输入或运行错误。独立 `review` 命令也支持 `--plan <file>`。在原生 Plan 中，主会话使用自动注入的 `submit --stdin`，用户无需手工运行以上命令。
 
-原生会话中，主会话可调用注入的同一脚本加 `status`、`retry` 或 `reset`，无需猜 session id。用户要求重新评审时，`retry` 保留意见并重置轮次预算，随后必须重提完整正文；用户取消计划时，`reset` 清除当前门禁。独立终端调用使用 `--session ... --cwd ...` 参数。两者都不改变 Codex sandbox 或执行授权，也不要求发送哈希批准口令。
+从已安装缓存目录运行独立 `status`/`plan` 时，会自动定位本插件的同一数据目录；源码目录下的独立调用仍使用 XDG state 默认值或显式 `--data-dir`，避免误读日常会话。
+
+运行中 `status` 的 `progress` 每约 2 秒更新，包含查询次数、阶段累计耗时和最后活动距今时间。结束后保存在 `review_metrics`，失败额外保存在 `diagnostics`。网络、认证、限流、配置和参数错误仅记录类别，不保存原始 stdout、stderr、命令、文件内容、会话 ID 或模型推理。`last_observed_phase` 是最近事件提供的线索，不保证代表超时瞬间的实际状态；没有事件时只说明尚未观察到引擎进展。超时仍不表示批准，也不自动降级模型或重试。
+
+升级后退出并用 `codex resume <会话 ID>` 恢复已有会话，确认启动上下文注入的是新版插件目录。hook 定义变化需要在 `/hooks` 中重新审阅信任；随后要求“重新评审原计划并继续原任务”，主会话会调用新版 `retry`，再通过 `submit --stdin` 重提完整正文。保留原计划和失败记录，不需要 `reset` 或重新开始需求分析。
+
+原生会话中，主会话可调用注入的同一脚本加 `status`、`plan`、`retry` 或 `reset`，无需猜 session id。`plan` 在门禁期间也可返回已保存的计划正文，无需编写 Python 读取状态文件。常见 `git -C … status/diff` 和简单 `sed -n '1,30p'` 查询可继续使用；任意解释器、Git 配置覆盖、sed 执行/写入仍不按只读处理。用户要求重新评审时，`retry` 保留意见并重置轮次预算，随后必须重提完整正文；用户取消计划时，`reset` 清除当前门禁。独立终端调用使用 `--session ... --cwd ...` 参数。两者都不改变 Codex sandbox 或执行授权，也不要求发送哈希批准口令。
 
 ## 能力边界
 

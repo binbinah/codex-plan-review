@@ -1,6 +1,6 @@
 {
   "name": "plan-review",
-  "version": "0.1.1",
+  "version": "0.1.3",
   "description": "Independent red-team review before Codex executes a completed Plan, with scoped mechanical task delegation.",
   "author": {"name": "binbinah"},
   "license": "MIT",

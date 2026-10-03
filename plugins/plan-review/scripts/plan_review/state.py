@@ -25,6 +25,16 @@ def data_root() -> Path:
         return Path(os.environ["PLAN_REVIEW_DATA_DIR"]).expanduser()
     if os.environ.get("PLUGIN_DATA"):
         return Path(os.environ["PLUGIN_DATA"]) / "plan-review"
+    # Installed standalone commands do not inherit PLUGIN_DATA. Use the same
+    # Codex-owned directory as hooks, rather than silently reading an empty XDG store.
+    home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser()
+    try:
+        installed = Path(__file__).resolve().relative_to(home.resolve() / "plugins/cache")
+    except ValueError:
+        installed = None
+    if installed is not None and len(installed.parts) >= 3:
+        marketplace, plugin = installed.parts[:2]
+        return home / "plugins/data" / f"{plugin}-{marketplace}" / "plan-review"
     base = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state")))
     return base / "codex-plan-review"
 
