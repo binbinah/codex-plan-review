@@ -86,6 +86,33 @@ class EngineTests(unittest.TestCase):
         key = "-----BEGIN PRIVATE KEY-----\nSYNTHETIC\n-----END PRIVATE KEY-----"
         self.assertNotIn("SYNTHETIC", context.redact(key))
 
+    def test_mcp_overrides_target_existing_names_using_cli_path_semantics(self):
+        config = {
+            "mcp_servers": {
+                "node_repl": {"command": "node"},
+                "chrome-devtools": {"command": "npx"},
+            }
+        }
+        (self.root / "config.toml").write_text(
+            '[mcp_servers.node_repl]\ncommand="node"\n'
+            '[mcp_servers.chrome-devtools]\ncommand="npx"\n'
+        )
+        args = reviewer.isolation_args(self.root)
+        for index, flag in enumerate(args):
+            if flag != "-c" or not args[index + 1].startswith("mcp_servers."):
+                continue
+            path, value = args[index + 1].split("=", 1)
+            components = path.split(".")
+            assert len(components) == 3
+            self.assertIn(components[1], config["mcp_servers"])
+            self.assertEqual(components[2], "enabled")
+            self.assertEqual(value, "false")
+
+    def test_unrepresentable_mcp_name_fails_before_process_start(self):
+        (self.root / "config.toml").write_text('[mcp_servers."name.with.dots"]\ncommand="node"\n')
+        with self.assertRaises(reviewer.ReviewError):
+            reviewer.isolation_args(self.root)
+
 
 if __name__ == "__main__":
     unittest.main()

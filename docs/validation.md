@@ -4,7 +4,7 @@
 
 ## 本地检查
 
-- `python3 -m unittest discover -s tests -v`：51 个测试通过，退出码 0。
+- `python3 -m unittest discover -s tests -v`：53 个测试通过，退出码 0。
 - `ruff check .`、`ruff format --check .` 与 Python 编译检查：退出码 0。
 - 两个 skill 通过官方 skill-creator 的结构校验。
 - 测试覆盖普通会话、直接正文提交、修订、异常输出、超时进程清理、预算、恢复、只读放行、并发、旧结果丢弃、最终正文变化、未跟踪文件变化和状态损坏。
@@ -46,3 +46,9 @@
 - Windows、普通 Chat、云编排和其他 Codex 版本。
 - 生产发布、数据库变更、跨供应商评审与复杂并行任务。
 - 禁用、未信任 hooks 或模型跳过提交协议时，不能保证红队发生。
+
+## 0.1.1 本机安装修复
+
+在带有 node_repl、computer-use 和 chrome-devtools 的日常配置中，0.1.0 的红队子进程退出码为 1，错误为 `Error loading config.toml: invalid transport`。原因是 CLI `-c` 路径不按 TOML 语法去除段名的引号，原参数创建了带引号的新 MCP 名称。
+
+0.1.1 改用 CLI 支持的直接段名路径；对不能安全表达的名称在启动前明确失败。修正参数的真实只读 Codex 调用返回 `OK`，退出码 0，并新增对应的配置协议回归测试。保留用户的模型、供应商配置；MCP 仍在红队进程中禁用。

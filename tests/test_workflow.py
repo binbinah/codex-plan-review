@@ -499,7 +499,7 @@ class ProtocolTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td, patch.dict(os.environ, {"CODEX_HOME": td}):
             (Path(td) / "config.toml").write_text('[mcp_servers.danger]\ncommand="writer"\n')
             args = reviewer.isolation_args(Path(td))
-            self.assertIn('mcp_servers."danger".enabled=false', args)
+            self.assertIn("mcp_servers.danger.enabled=false", args)
             self.assertIn("hooks", args)
             self.assertNotIn("--ignore-user-config", args)
 

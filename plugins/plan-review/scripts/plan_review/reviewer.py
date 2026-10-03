@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import subprocess
 import tempfile
@@ -130,7 +131,10 @@ def isolation_args(cwd: Path) -> list[str]:
     for layer in config_layers(cwd):
         names.update(layer.get("mcp_servers", {}))
     for name in sorted(names):
-        args += ["-c", f"mcp_servers.{json.dumps(name)}.enabled=false"]
+        # CLI -c paths split on dots; quotes become part of the server name.
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+            raise ReviewError("MCP 名称不能安全表示为 CLI 配置路径；未运行红队")
+        args += ["-c", f"mcp_servers.{name}.enabled=false"]
     return args
 
 
