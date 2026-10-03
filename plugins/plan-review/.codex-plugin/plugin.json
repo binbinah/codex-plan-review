@@ -1,0 +1,10 @@
+{
+  "name": "plan-review",
+  "version": "0.1.0",
+  "description": "Independent red-team review before Codex executes a completed Plan, with scoped mechanical task delegation.",
+  "author": {"name": "binbinah"},
+  "license": "MIT",
+  "repository": "https://github.com/binbinah/codex-plan-review",
+  "skills": "./skills/",
+  "hooks": "./hooks/hooks.json"
+}
