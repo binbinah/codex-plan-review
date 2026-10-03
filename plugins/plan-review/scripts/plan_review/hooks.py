@@ -14,7 +14,7 @@ from . import reviewer
 from .context import bundle, redact
 from .policy import read_only_tool
 from .state import StateError, Store, data_root, digest
-from .submission import extract_submission, output_command, recovery_command, submit_command
+from .submission import output_command, parse_submission, recovery_command, submit_command
 
 WORKFLOW = """Before finalizing a native Plan, submit its complete Markdown body
 to the installed plan-review command using a literal single-quoted heredoc.
@@ -29,6 +29,9 @@ user authorization. It does not grant permission for new external actions.
 Delegate mechanical work only when the user or applicable skill/project instructions
 request it. Specify files, required behavior, dependencies, and acceptance commands.
 Verify returned artifacts and command results before accepting a worker's claim.
+Specify each actual target project with --project <directory>, especially from a
+multi-repository workspace. Add --evidence <file> for the key existing source files
+already inspected; paths must belong to those projects. Do not redo kickoff in the reviewer.
 """
 
 WORKER = """Execute only the parent's explicit assignment. Keep edits within the
@@ -41,12 +44,12 @@ Report changed paths, executed validation commands, exit codes, and remaining ga
 
 def limits() -> tuple[int, int]:
     try:
-        timeout = int(os.environ.get("PLAN_REVIEW_TIMEOUT_SECONDS", "240"))
+        timeout = int(os.environ.get("PLAN_REVIEW_TIMEOUT_SECONDS", str(reviewer.DEFAULT_TIMEOUT)))
         rounds = int(os.environ.get("PLAN_REVIEW_MAX_ROUNDS", "3"))
     except ValueError as exc:
         raise StateError("PLAN_REVIEW_TIMEOUT_SECONDS/MAX_ROUNDS 必须是整数") from exc
-    if not 1 <= timeout <= 270 or not 1 <= rounds <= 10:
-        raise StateError("评审超时须为 1–270 秒，轮次须为 1–10")
+    if not 1 <= timeout <= reviewer.MAX_TIMEOUT or not 1 <= rounds <= 10:
+        raise StateError(f"评审超时须为 1–{reviewer.MAX_TIMEOUT} 秒，轮次须为 1–10")
     return timeout, rounds
 
 
@@ -96,11 +99,31 @@ def review_plan(
     cwd: Path,
     plan: str,
     review_fn: Callable = reviewer.run,
+    scope: dict | None = None,
 ) -> dict:
     timeout, max_rounds = limits()
     with store.locked():
         state = store.read()
-        context = bundle(cwd, plan, state.get("requests", []), state.get("history", []))
+        if scope is None and state.get("plan_hash") == digest(plan):
+            scope = state.get("review_scope")
+        try:
+            context = bundle(cwd, plan, state.get("requests", []), state.get("history", []), scope)
+        except (OSError, ValueError) as exc:
+            if state.get("status") in {"approved", "executing"}:
+                state.update(rounds=0, history=[], worker_reports=[])
+            state.update(
+                status="needs_revision",
+                plan=redact(plan),
+                plan_hash=digest(plan),
+                stored_plan_hash=digest(redact(plan)),
+                context_digest=state.get("context_digest", digest("")),
+                rounds=state.get("rounds", 0),
+                error=redact(str(exc))[:1000],
+            )
+            for key in ("result", "review_token", "deadline", "progress"):
+                state.pop(key, None)
+            store.write(state)
+            raise
         plan_hash = digest(plan)
         basis = context["repository"]["basis_hash"]
         if state.get("plan_hash") == plan_hash and state.get("context_digest") == basis:
@@ -119,6 +142,9 @@ def review_plan(
             )
         token = uuid.uuid4().hex
         state.pop("result", None)
+        state.pop("diagnostics", None)
+        state.pop("progress", None)
+        state.pop("review_metrics", None)
         state.update(
             {
                 "status": "reviewing",
@@ -126,6 +152,7 @@ def review_plan(
                 "plan_hash": plan_hash,
                 "stored_plan_hash": digest(redact(plan)),
                 "context_digest": basis,
+                "review_scope": context["scope"],
                 "review_token": token,
                 "deadline": time.time() + timeout + 10,
                 "rounds": state.get("rounds", 0) + 1,
@@ -135,18 +162,36 @@ def review_plan(
     # Never hold a state lock across the potentially slow model call.
     result = None
     error = None
+    diagnostics = None
+
+    def report_progress(value: dict) -> None:
+        with store.locked():
+            current = store.read()
+            if current.get("review_token") == token:
+                current["progress"] = value
+                store.write(current)
+
     try:
-        result = reviewer.validate(review_fn(context, cwd, timeout))
+        if review_fn is reviewer.run:
+            result = reviewer.validate(review_fn(context, cwd, timeout, progress=report_progress))
+        else:
+            result = reviewer.validate(review_fn(context, cwd, timeout))
     except (reviewer.ReviewError, OSError, ValueError) as exc:
         error = redact(str(exc))[:1000]
+        if isinstance(exc, reviewer.ReviewError):
+            diagnostics = exc.diagnostics
     with store.locked():
         state = store.read()
         if state.get("review_token") != token:
             return paused("计划或状态已改变，本次旧评审结果已丢弃。")
         state.pop("review_token", None)
         state.pop("deadline", None)
+        if "progress" in state:
+            state["review_metrics"] = state.pop("progress")
         if error is not None:
             state.update(status="review_failed", error=error)
+            if diagnostics is not None:
+                state["diagnostics"] = diagnostics
             store.write(state)
             return paused(f"红队评审未完成：{error}\n实施未放行；可继续只读调查并重试评审。")
         state.pop("error", None)
@@ -242,19 +287,25 @@ def handle(payload: dict, review_fn: Callable = reviewer.run) -> dict:
                     if state.get("status") not in {"approved", "executing"} or (
                         state.get("plan_hash") != digest(plan)
                     ):
-                        context = bundle(Path(cwd), plan, [], [])
                         state.update(
                             {
                                 "status": "needs_revision",
                                 "plan": redact(plan),
                                 "plan_hash": digest(plan),
                                 "stored_plan_hash": digest(redact(plan)),
-                                "context_digest": context["repository"]["basis_hash"],
+                                "context_digest": state.get("context_digest", digest("")),
                                 "rounds": 0,
                                 "error": "最终正文尚未按相同内容通过红队",
                             }
                         )
                         state.pop("result", None)
+                        state.pop("review_token", None)
+                        state.pop("deadline", None)
+                        store.write(state)
+                        # Revoke first: missing/deleted scope or evidence must never
+                        # leave the previous approved plan executable.
+                        context = bundle(Path(cwd), plan, [], [], state.get("review_scope"))
+                        state["context_digest"] = context["repository"]["basis_hash"]
                         store.write(state)
                         return {
                             "decision": "block",
@@ -293,8 +344,14 @@ def handle(payload: dict, review_fn: Callable = reviewer.run) -> dict:
                             "status": state.get("status", "idle"),
                             "rounds": state.get("rounds", 0),
                             "error": state.get("error"),
+                            "diagnostics": state.get("diagnostics"),
+                            "progress": state.get("progress"),
+                            "review_metrics": state.get("review_metrics"),
+                            "review_scope": state.get("review_scope"),
                             "notice": "重新评审请通过 submit --stdin 提交完整原文。",
                         }
+                        if recovery == "plan":
+                            response["plan"] = state.get("plan")
                 return {
                     "hookSpecificOutput": {
                         "hookEventName": event,
@@ -303,13 +360,13 @@ def handle(payload: dict, review_fn: Callable = reviewer.run) -> dict:
                     }
                 }
             submitted = (
-                extract_submission(args.get("command", args.get("cmd")))
+                parse_submission(args.get("command", args.get("cmd")))
                 if name in {"Bash", "exec_command", "shell_command"}
                 else None
             )
             if submitted is not None:
-                plan = normalize_plan(submitted)
-                review_plan(store, Path(cwd), plan, review_fn)
+                plan = normalize_plan(submitted["plan"])
+                review_plan(store, Path(cwd), plan, review_fn, submitted["scope"])
                 with store.locked():
                     state = store.read()
                     matches = state.get("plan_hash") == digest(plan)
@@ -320,6 +377,9 @@ def handle(payload: dict, review_fn: Callable = reviewer.run) -> dict:
                         "plan_sha256": digest(plan),
                         "review": state.get("result") if matches else None,
                         "error": state.get("error"),
+                        "diagnostics": state.get("diagnostics"),
+                        "review_metrics": state.get("review_metrics"),
+                        "review_scope": state.get("review_scope"),
                         "approved": approved,
                         "rounds": state.get("rounds", 0),
                         "max_rounds": limits()[1],
@@ -341,7 +401,7 @@ def handle(payload: dict, review_fn: Callable = reviewer.run) -> dict:
                 if read_only_tool(payload.get("tool_name", ""), args):
                     return {}
                 if state.get("status") == "approved":
-                    current = bundle(Path(cwd), state["plan"], [], [])
+                    current = bundle(Path(cwd), state["plan"], [], [], state.get("review_scope"))
                     if current["repository"]["basis_hash"] == state["context_digest"]:
                         state.update(status="executing", execution_started_at=time.time())
                         store.write(state)
@@ -405,7 +465,9 @@ def workflow_context() -> str:
         + (
             submit_command() + " <<'CODEX_PLAN_REVIEW'\n"
             "<complete Markdown plan body, without proposed_plan tags>\nCODEX_PLAN_REVIEW\n"
-            "For status, call the same script with `status`. For user-requested renewed review, "
+            "Append --project <directory> and --evidence <file> before the heredoc as needed.\n"
+            "For progress use `status`; for the saved body use `plan`. "
+            "For user-requested renewed review, "
             "call `retry` then resubmit the complete body. Only when the user cancels the plan, "
             "call `reset`. Native hooks bind these commands to this session automatically.\n"
         )

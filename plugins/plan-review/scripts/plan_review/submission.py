@@ -14,7 +14,7 @@ def submit_command() -> str:
     return f"python3 {shlex.quote(str(SCRIPT))} submit --stdin"
 
 
-def extract_submission(command: object) -> str | None:
+def parse_submission(command: object) -> dict | None:
     if not isinstance(command, str):
         return None
     match = re.fullmatch(
@@ -28,15 +28,28 @@ def extract_submission(command: object) -> str | None:
         argv = shlex.split(match["head"])
     except ValueError:
         return None
-    if len(argv) != 4 or Path(argv[0]).name != "python3":
+    if len(argv) < 4 or Path(argv[0]).name != "python3":
         return None
-    if argv[2:] != ["submit", "--stdin"]:
+    if argv[2:4] != ["submit", "--stdin"]:
         return None
     if Path(argv[1]).resolve() != SCRIPT:
         return None
     if any(line.rstrip("\r") == match["label"] for line in match["body"].splitlines()):
         return None
-    return match["body"]
+    scope = {"projects": [], "evidence_files": []}
+    extra = argv[4:]
+    if len(extra) % 2:
+        return None
+    for option, value in zip(extra[::2], extra[1::2]):
+        if option not in {"--project", "--evidence"} or not value or value.startswith("-"):
+            return None
+        scope["projects" if option == "--project" else "evidence_files"].append(value)
+    return {"plan": match["body"], "scope": scope}
+
+
+def extract_submission(command: object) -> str | None:
+    request = parse_submission(command)
+    return request["plan"] if request else None
 
 
 def output_command(result: dict) -> str:
@@ -53,6 +66,6 @@ def recovery_command(command: object) -> str | None:
         return None
     if len(argv) != 3 or Path(argv[0]).name != "python3":
         return None
-    if Path(argv[1]).resolve() != SCRIPT or argv[2] not in {"status", "retry", "reset"}:
+    if Path(argv[1]).resolve() != SCRIPT or argv[2] not in {"status", "plan", "retry", "reset"}:
         return None
     return argv[2]
